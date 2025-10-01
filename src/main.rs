@@ -1,17 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use nannou::image;
-use nannou::prelude::*;
-use nannou_egui::{self, egui, Egui};
 use nannou::image::{DynamicImage, GenericImageView, ImageError};
+use nannou::prelude::*;
 use nannou::rand::{thread_rng, Rng};
-use std::env;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::Path;
+use nannou_egui::{self, egui, Egui};
 use rfd::FileDialog;
+use std::env;
+use std::fs::{create_dir_all, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
+
+#[cfg(windows)]
+use winapi::shared::minwindef::FALSE;
+#[cfg(windows)]
+use winapi::shared::windef::HWND;
+#[cfg(windows)]
+use winapi::um::winuser::{
+    FindWindowW, GetClientRect, GetWindowLongPtrW, MoveWindow, SetParent, SetWindowLongPtrW,
+    GWL_STYLE, WS_CHILD, WS_VISIBLE,
+};
+
+static PREVIEW_RUNNING: AtomicBool = AtomicBool::new(false);
+static mut PREVIEW_PARENT_HWND: Option<isize> = None;
 
 struct ConfigModel {
     egui: Egui,
@@ -20,13 +34,18 @@ struct ConfigModel {
     custom_image_path: String,
     file_dialog_receiver: Option<mpsc::Receiver<Option<String>>>,
     is_file_dialog_open: bool,
+    should_exit: bool,
 }
 
 struct Model {
     image: DynamicImage,
+    original_image: DynamicImage,
     dvd_rect: Rect,
     dvd_vel: Vec2,
     m_pos: Option<Vec2>,
+    is_preview: bool,
+    #[allow(dead_code)]
+    preview_parent: Option<isize>,
 }
 
 #[derive(Clone)]
@@ -38,13 +57,179 @@ struct ScreenSaverConfig {
 }
 
 fn main() {
-    let flag = env::args().nth(1).unwrap_or_default();
-    if flag.starts_with("/c") {
-        show_configuration_dialog();
-    } else if flag.starts_with("/p") {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() == 1 {
         nannou::app(model).update(update).run();
+        return;
+    }
+
+    let flag = &args[1].to_lowercase();
+
+    if flag.starts_with("/c") || flag.starts_with("-c") {
+        show_configuration_dialog();
+    } else if flag.starts_with("/p") || flag.starts_with("-p") {
+        let hwnd = parse_preview_hwnd(&args);
+        run_preview_mode(hwnd);
+    } else if flag.starts_with("/s") || flag.starts_with("-s") {
+        nannou::app(model).update(update).run();
+    } else if flag.starts_with("/a") || flag.starts_with("-a") {
+        std::process::exit(0);
     } else {
         nannou::app(model).update(update).run();
+    }
+}
+
+fn parse_preview_hwnd(args: &[String]) -> Option<isize> {
+    if args.len() > 2 {
+        args[2].parse::<isize>().ok()
+    } else if args.len() > 1 {
+        let flag = &args[1];
+        if flag.len() > 2 {
+            flag[2..].parse::<isize>().ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn run_preview_mode(hwnd: Option<isize>) {
+    if PREVIEW_RUNNING.swap(true, Ordering::SeqCst) {
+        std::process::exit(0);
+    }
+
+    unsafe {
+        PREVIEW_PARENT_HWND = hwnd;
+    }
+
+    if hwnd.is_some() {
+        nannou::app(preview_model_embedded).update(update).run();
+    } else {
+        nannou::app(preview_model_standalone).update(update).run();
+    }
+
+    PREVIEW_RUNNING.store(false, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+fn preview_model_embedded(app: &App) -> Model {
+    let parent_hwnd = unsafe { PREVIEW_PARENT_HWND };
+
+    let _window_id = app
+        .new_window()
+        .size(200, 150)
+        .title("DVD Screensaver Preview")
+        .event(window_event)
+        .view(view)
+        .decorations(false)
+        .resizable(false)
+        .build()
+        .unwrap();
+
+    if let Some(parent_hwnd) = parent_hwnd {
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(200));
+
+            unsafe {
+                let window_title = std::ffi::CString::new("DVD Screensaver Preview").unwrap();
+                let mut title_wide: Vec<u16> =
+                    window_title.to_string_lossy().encode_utf16().collect();
+                title_wide.push(0);
+
+                let child_hwnd = FindWindowW(std::ptr::null(), title_wide.as_ptr());
+
+                if !child_hwnd.is_null() {
+                    let parent = parent_hwnd as HWND;
+
+                    let mut client_rect = std::mem::zeroed();
+                    if GetClientRect(parent, &mut client_rect) != FALSE {
+                        let width = client_rect.right - client_rect.left;
+                        let height = client_rect.bottom - client_rect.top;
+
+                        let _current_style = GetWindowLongPtrW(child_hwnd, GWL_STYLE);
+
+                        SetParent(child_hwnd, parent);
+
+                        let new_style = (WS_CHILD | WS_VISIBLE) as isize;
+                        SetWindowLongPtrW(child_hwnd, GWL_STYLE, new_style);
+
+                        MoveWindow(child_hwnd, 0, 0, width, height, 1);
+                    }
+                }
+            }
+        });
+    }
+
+    create_preview_model(true, parent_hwnd)
+}
+
+#[cfg(not(windows))]
+fn preview_model_embedded(app: &App) -> Model {
+    preview_model_standalone(app)
+}
+
+fn preview_model_standalone(app: &App) -> Model {
+    let _window_id = app
+        .new_window()
+        .size(200, 150)
+        .title("DVD Screensaver Preview")
+        .event(window_event)
+        .view(view)
+        .decorations(true)
+        .always_on_top(true)
+        .resizable(false)
+        .build()
+        .unwrap();
+
+    create_preview_model(true, None)
+}
+
+fn create_preview_model(is_preview: bool, parent_hwnd: Option<isize>) -> Model {
+    let config = load_config();
+
+    let preview_size = if parent_hwnd.is_some() {
+        (100.0, 75.0)
+    } else {
+        (200.0, 150.0)
+    };
+
+    let original_image = match get_image_data(config.image_index, &config.custom_image_path) {
+        Ok(img) => {
+            let target_width = (preview_size.0 * config.size_factor * 2.0) as u32;
+            let target_height = (preview_size.1 * config.size_factor * 2.0) as u32;
+
+            img.thumbnail(target_width.max(40), target_height.max(30))
+        }
+        Err(_) => {
+            let data = include_bytes!("../assets/dvd_logo.png");
+            let default_img = image::load_from_memory(data).expect("Unable to load default icon");
+
+            let target_width = (preview_size.0 * config.size_factor * 2.0) as u32;
+            let target_height = (preview_size.1 * config.size_factor * 2.0) as u32;
+
+            default_img.thumbnail(target_width.max(40), target_height.max(30))
+        }
+    };
+
+    let image = change_color(&original_image);
+
+    let rect = Rect::from_x_y_w_h(
+        0.0,
+        0.0,
+        image.dimensions().0 as f32,
+        image.dimensions().1 as f32,
+    );
+
+    Model {
+        image,
+        original_image,
+        dvd_rect: rect,
+        dvd_vel: Vec2::new(config.speed * 0.5, config.speed * 0.5),
+        m_pos: None,
+        is_preview,
+        preview_parent: parent_hwnd,
     }
 }
 
@@ -56,7 +241,7 @@ fn show_configuration_dialog() {
 }
 
 fn config_model(app: &App) -> ConfigModel {
-    let window_id = app
+    let _window_id = app
         .new_window()
         .size(500, 400)
         .title("DVD Screensaver Configuration")
@@ -65,7 +250,7 @@ fn config_model(app: &App) -> ConfigModel {
         .build()
         .unwrap();
 
-    let window = app.window(window_id).unwrap();
+    let window = app.window(_window_id).unwrap();
     let egui = Egui::from_window(&window);
 
     let config = load_config();
@@ -82,10 +267,15 @@ fn config_model(app: &App) -> ConfigModel {
         custom_image_path: config.custom_image_path,
         file_dialog_receiver: None,
         is_file_dialog_open: false,
+        should_exit: false,
     }
 }
 
-fn config_update(app: &App, model: &mut ConfigModel, update: Update) {
+fn config_update(_app: &App, model: &mut ConfigModel, update: Update) {
+    if model.should_exit {
+        std::process::exit(0);
+    }
+
     let egui = &mut model.egui;
     egui.set_elapsed_time(update.since_start);
 
@@ -105,10 +295,9 @@ fn config_update(app: &App, model: &mut ConfigModel, update: Update) {
     let mut fonts = egui::FontDefinitions::default();
 
     if let Ok(font_data) = std::fs::read("C:/Windows/Fonts/segoeui.ttf") {
-        fonts.font_data.insert(
-            "Segoe UI".to_owned(),
-            egui::FontData::from_owned(font_data),
-        );
+        fonts
+            .font_data
+            .insert("Segoe UI".to_owned(), egui::FontData::from_owned(font_data));
 
         fonts
             .families
@@ -125,18 +314,21 @@ fn config_update(app: &App, model: &mut ConfigModel, update: Update) {
         ctx.set_fonts(fonts);
     }
 
+    let mut window_open = true;
     egui::Window::new("DVD Screensaver Settings")
         .default_size([450.0, 350.0])
+        .open(&mut window_open)
         .show(&ctx, |ui| {
             ui.heading("Movement Speed");
-            ui.add(egui::Slider::new(&mut model.config.speed, 10.0..=200.0)
-                .text("pixels/second"));
+            ui.add(egui::Slider::new(&mut model.config.speed, 10.0..=200.0).text("pixels/second"));
 
             ui.separator();
 
             ui.heading("Icon Selection");
             egui::ComboBox::from_label("Select Icon")
-                .selected_text(&model.image_names[model.config.image_index.min(model.image_names.len() - 1)])
+                .selected_text(
+                    &model.image_names[model.config.image_index.min(model.image_names.len() - 1)],
+                )
                 .show_ui(ui, |ui| {
                     for (i, name) in model.image_names.iter().enumerate() {
                         ui.selectable_value(&mut model.config.image_index, i, name);
@@ -154,14 +346,23 @@ fn config_update(app: &App, model: &mut ConfigModel, update: Update) {
                         "Browse File"
                     };
 
-                    if ui.add_enabled(!model.is_file_dialog_open, egui::Button::new(button_text)).clicked() {
+                    if ui
+                        .add_enabled(!model.is_file_dialog_open, egui::Button::new(button_text))
+                        .clicked()
+                    {
                         let (sender, receiver) = mpsc::channel();
                         model.file_dialog_receiver = Some(receiver);
                         model.is_file_dialog_open = true;
 
                         thread::spawn(move || {
                             let result = FileDialog::new()
-                                .add_filter("Image Files", &["png", "jpg", "jpeg", "gif", "bmp", "ico", "tiff", "tif", "webp"])
+                                .add_filter(
+                                    "Image Files",
+                                    &[
+                                        "png", "jpg", "jpeg", "gif", "bmp", "ico", "tiff", "tif",
+                                        "webp",
+                                    ],
+                                )
                                 .add_filter("PNG Files", &["png"])
                                 .add_filter("JPEG Files", &["jpg", "jpeg"])
                                 .add_filter("GIF Files", &["gif"])
@@ -186,14 +387,25 @@ fn config_update(app: &App, model: &mut ConfigModel, update: Update) {
                     if path.exists() {
                         if let Some(extension) = path.extension() {
                             let ext = extension.to_string_lossy().to_lowercase();
-                            let supported_formats = ["png", "jpg", "jpeg", "gif", "bmp", "ico", "tiff", "tif", "webp"];
+                            let supported_formats = [
+                                "png", "jpg", "jpeg", "gif", "bmp", "ico", "tiff", "tif", "webp",
+                            ];
                             if supported_formats.contains(&ext.as_str()) {
-                                ui.colored_label(egui::Color32::GREEN, "✓ File exists and format is supported");
+                                ui.colored_label(
+                                    egui::Color32::GREEN,
+                                    "✓ File exists and format is supported",
+                                );
                             } else {
-                                ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "⚠ File exists but format may not be supported");
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 165, 0),
+                                    "⚠ File exists but format may not be supported",
+                                );
                             }
                         } else {
-                            ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "⚠ File exists but has no extension");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 165, 0),
+                                "⚠ File exists but has no extension",
+                            );
                         }
                     } else {
                         ui.colored_label(egui::Color32::RED, "✗ File does not exist");
@@ -226,19 +438,21 @@ fn config_update(app: &App, model: &mut ConfigModel, update: Update) {
             ui.separator();
 
             ui.heading("Icon Size");
-            ui.add(egui::Slider::new(&mut model.config.size_factor, 0.05..=0.5)
-                .text("size multiplier"));
+            ui.add(
+                egui::Slider::new(&mut model.config.size_factor, 0.05..=0.5)
+                    .text("size multiplier"),
+            );
 
             ui.separator();
 
             ui.horizontal(|ui| {
                 if ui.button("Save and Exit").clicked() {
                     save_config(&model.config);
-                    app.quit();
+                    model.should_exit = true;
                 }
 
                 if ui.button("Cancel").clicked() {
-                    app.quit();
+                    model.should_exit = true;
                 }
 
                 if ui.button("Reset to Default").clicked() {
@@ -255,20 +469,43 @@ fn config_update(app: &App, model: &mut ConfigModel, update: Update) {
             ui.separator();
             ui.small("Tip: Drag image files to the path field to quickly set the path");
         });
+
+    if !window_open {
+        model.should_exit = true;
+    }
 }
 
 fn config_view(_app: &App, model: &ConfigModel, frame: Frame) {
     model.egui.draw_to_frame(&frame).unwrap();
 }
 
-fn raw_window_event(_app: &App, model: &mut ConfigModel, event: &nannou::winit::event::WindowEvent) {
+fn raw_window_event(
+    _app: &App,
+    model: &mut ConfigModel,
+    event: &nannou::winit::event::WindowEvent,
+) {
     model.egui.handle_raw_event(event);
+
+    if let nannou::winit::event::WindowEvent::CloseRequested = event {
+        model.should_exit = true;
+    }
+}
+
+fn get_config_path() -> PathBuf {
+    if let Some(appdata) = dirs::config_dir() {
+        let config_dir = appdata.join("DVDScreensaver");
+        let _ = create_dir_all(&config_dir);
+        config_dir.join("config.ini")
+    } else {
+        PathBuf::from("screensaver.ini")
+    }
 }
 
 fn load_config() -> ScreenSaverConfig {
-    let config_path = Path::new("screensaver.ini");
+    let config_path = get_config_path();
+
     if config_path.exists() {
-        if let Ok(mut file) = File::open(config_path) {
+        if let Ok(mut file) = File::open(&config_path) {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
                 let mut lines = contents.lines();
@@ -276,11 +513,11 @@ fn load_config() -> ScreenSaverConfig {
                 let image_index = lines.next().unwrap_or("0").parse().unwrap_or(0);
                 let size_factor = lines.next().unwrap_or("0.16").parse().unwrap_or(0.16);
                 let custom_image_path = lines.next().unwrap_or("").to_string();
-                return ScreenSaverConfig { 
-                    speed, 
-                    image_index, 
-                    size_factor, 
-                    custom_image_path 
+                return ScreenSaverConfig {
+                    speed,
+                    image_index,
+                    size_factor,
+                    custom_image_path,
                 };
             }
         }
@@ -295,11 +532,17 @@ fn load_config() -> ScreenSaverConfig {
 }
 
 fn save_config(config: &ScreenSaverConfig) {
+    let config_path = get_config_path();
+
+    if let Some(parent) = config_path.parent() {
+        let _ = create_dir_all(parent);
+    }
+
     if let Ok(mut file) = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open("screensaver.ini")
+        .open(&config_path)
     {
         let _ = writeln!(file, "{}", config.speed);
         let _ = writeln!(file, "{}", config.image_index);
@@ -312,7 +555,7 @@ fn load_image_safe(path: &str) -> Result<DynamicImage, ImageError> {
     if path.is_empty() {
         return Err(ImageError::IoError(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Empty path"
+            "Empty path",
         )));
     }
 
@@ -320,7 +563,7 @@ fn load_image_safe(path: &str) -> Result<DynamicImage, ImageError> {
     if !path.exists() {
         return Err(ImageError::IoError(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "File not found"
+            "File not found",
         )));
     }
 
@@ -333,34 +576,34 @@ fn get_image_data(image_index: usize, custom_path: &str) -> Result<DynamicImage,
             let data = include_bytes!("../assets/dvd_logo.png");
             image::load_from_memory(data)
                 .map_err(|e| format!("Unable to load built-in icon 1: {}", e))
-        },
+        }
         1 => {
             let data = include_bytes!("../assets/dvd_logo2.png");
             image::load_from_memory(data)
                 .map_err(|e| format!("Unable to load built-in icon 2: {}", e))
-        },
+        }
         2 => {
             if custom_path.is_empty() {
                 return Err("No custom icon path specified".to_string());
             }
-            
+
             load_image_safe(custom_path)
                 .map_err(|e| format!("Unable to load custom icon '{}': {}", custom_path, e))
-        },
+        }
         _ => {
             let data = include_bytes!("../assets/dvd_logo.png");
-            image::load_from_memory(data)
-                .map_err(|e| format!("Unable to load default icon: {}", e))
+            image::load_from_memory(data).map_err(|e| format!("Unable to load default icon: {}", e))
         }
     }
 }
 
 fn change_color(image: &DynamicImage) -> DynamicImage {
-    image.huerotate(thread_rng().gen_range(120..240))
+    let hue_shift = thread_rng().gen_range(60..300);
+    image.huerotate(hue_shift)
 }
 
 fn model(app: &App) -> Model {
-    let primary_window_id = app
+    let _primary_window_id = app
         .new_window()
         .event(window_event)
         .view(view)
@@ -368,33 +611,34 @@ fn model(app: &App) -> Model {
         .build()
         .unwrap();
 
-    let primary_window = app.window(primary_window_id).unwrap();
+    let primary_window = app.window(_primary_window_id).unwrap();
     primary_window.set_cursor_visible(false);
 
     let config = load_config();
 
-    let image = match get_image_data(config.image_index, &config.custom_image_path) {
+    let original_image = match get_image_data(config.image_index, &config.custom_image_path) {
         Ok(img) => {
             let window_rect = app.window_rect();
             let target_width = (window_rect.w() * config.size_factor) as u32;
             let target_height = (window_rect.h() * config.size_factor) as u32;
-            
-            change_color(&img.thumbnail(target_width, target_height))
-        },
+
+            img.thumbnail(target_width, target_height)
+        }
         Err(error) => {
             eprintln!("Icon loading failed: {}, using default icon", error);
 
             let data = include_bytes!("../assets/dvd_logo.png");
-            let default_img = image::load_from_memory(data)
-                .expect("Unable to load default icon");
+            let default_img = image::load_from_memory(data).expect("Unable to load default icon");
 
             let window_rect = app.window_rect();
             let target_width = (window_rect.w() * config.size_factor) as u32;
             let target_height = (window_rect.h() * config.size_factor) as u32;
-            
-            change_color(&default_img.thumbnail(target_width, target_height))
+
+            default_img.thumbnail(target_width, target_height)
         }
     };
+
+    let image = change_color(&original_image);
 
     let rect = Rect::from_x_y_w_h(
         0.0,
@@ -405,13 +649,20 @@ fn model(app: &App) -> Model {
 
     Model {
         image,
+        original_image,
         dvd_rect: rect,
         dvd_vel: Vec2::new(config.speed, config.speed),
         m_pos: None,
+        is_preview: false,
+        preview_parent: None,
     }
 }
 
 fn window_event(app: &App, model: &mut Model, event: WindowEvent) {
+    if model.is_preview {
+        return;
+    }
+
     if app.time > 0.1 {
         match event {
             WindowEvent::MouseMoved(pos) => {
@@ -435,18 +686,59 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     let delta_time = app.duration.since_prev_update.secs() as f32;
     let dvd_vel = &mut model.dvd_vel;
 
-    model.dvd_rect = model
-        .dvd_rect
-        .shift_x(dvd_vel.x * delta_time)
-        .shift_y(dvd_vel.y * delta_time);
+    let new_x = model.dvd_rect.x() + dvd_vel.x * delta_time;
+    let new_y = model.dvd_rect.y() + dvd_vel.y * delta_time;
 
-    if model.dvd_rect.left() <= win.left() || model.dvd_rect.right() >= win.right() {
-        dvd_vel.x = -dvd_vel.x;
-        model.image = change_color(&model.image);
+    model.dvd_rect = Rect::from_x_y_w_h(new_x, new_y, model.dvd_rect.w(), model.dvd_rect.h());
+
+    let mut color_changed = false;
+
+    if model.dvd_rect.left() <= win.left() {
+        model.dvd_rect = Rect::from_x_y_w_h(
+            win.left() + model.dvd_rect.w() / 2.0,
+            model.dvd_rect.y(),
+            model.dvd_rect.w(),
+            model.dvd_rect.h(),
+        );
+        dvd_vel.x = dvd_vel.x.abs();
+        color_changed = true;
     }
-    if model.dvd_rect.bottom() <= win.bottom() || model.dvd_rect.top() >= win.top() {
-        dvd_vel.y = -dvd_vel.y;
-        model.image = change_color(&model.image);
+
+    if model.dvd_rect.right() >= win.right() {
+        model.dvd_rect = Rect::from_x_y_w_h(
+            win.right() - model.dvd_rect.w() / 2.0,
+            model.dvd_rect.y(),
+            model.dvd_rect.w(),
+            model.dvd_rect.h(),
+        );
+        dvd_vel.x = -dvd_vel.x.abs();
+        color_changed = true;
+    }
+
+    if model.dvd_rect.bottom() <= win.bottom() {
+        model.dvd_rect = Rect::from_x_y_w_h(
+            model.dvd_rect.x(),
+            win.bottom() + model.dvd_rect.h() / 2.0,
+            model.dvd_rect.w(),
+            model.dvd_rect.h(),
+        );
+        dvd_vel.y = dvd_vel.y.abs();
+        color_changed = true;
+    }
+
+    if model.dvd_rect.top() >= win.top() {
+        model.dvd_rect = Rect::from_x_y_w_h(
+            model.dvd_rect.x(),
+            win.top() - model.dvd_rect.h() / 2.0,
+            model.dvd_rect.w(),
+            model.dvd_rect.h(),
+        );
+        dvd_vel.y = -dvd_vel.y.abs();
+        color_changed = true;
+    }
+
+    if color_changed {
+        model.image = change_color(&model.original_image);
     }
 }
 
