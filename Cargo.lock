@@ -738,9 +738,10 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "dvd-screensaver"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "dirs",
+ "lazy_static",
  "nannou",
  "nannou_egui",
  "raw-window-handle 0.5.2",

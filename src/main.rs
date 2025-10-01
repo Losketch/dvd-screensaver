@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::thread;
 
 #[cfg(windows)]
@@ -23,6 +24,10 @@ use winapi::um::winuser::{
     FindWindowW, GetClientRect, GetWindowLongPtrW, MoveWindow, SetParent, SetWindowLongPtrW,
     GWL_STYLE, WS_CHILD, WS_VISIBLE,
 };
+
+lazy_static::lazy_static! {
+    static ref LAST_HUE: Mutex<i32> = Mutex::new(0);
+}
 
 static PREVIEW_RUNNING: AtomicBool = AtomicBool::new(false);
 static mut PREVIEW_PARENT_HWND: Option<isize> = None;
@@ -598,8 +603,24 @@ fn get_image_data(image_index: usize, custom_path: &str) -> Result<DynamicImage,
 }
 
 fn change_color(image: &DynamicImage) -> DynamicImage {
-    let hue_shift = thread_rng().gen_range(60..300);
-    image.huerotate(hue_shift)
+    let mut rng = thread_rng();
+    let mut last_hue = LAST_HUE.lock().unwrap();
+
+    let mut new_hue;
+    loop {
+        new_hue = rng.gen_range(0..360);
+        let hue_diff = (new_hue - *last_hue).abs();
+        let min_diff = hue_diff.min(360 - hue_diff);
+
+        if min_diff >= 60 {
+            break;
+        }
+    }
+
+    *last_hue = new_hue;
+    drop(last_hue);
+
+    image.huerotate(new_hue).brighten(10).adjust_contrast(1.2)
 }
 
 fn model(app: &App) -> Model {
