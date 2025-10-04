@@ -65,7 +65,12 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() == 1 {
-        nannou::app(model).update(update).run();
+        nannou::app(model)
+            .update(update)
+            .loop_mode(nannou::LoopMode::Rate { 
+                update_interval: std::time::Duration::from_secs_f64(1.0 / 60.0) 
+            })
+            .run();
         return;
     }
 
@@ -185,6 +190,7 @@ fn preview_model_standalone(app: &App) -> Model {
         .decorations(true)
         .always_on_top(true)
         .resizable(false)
+        .msaa_samples(4)
         .build()
         .unwrap();
 
@@ -481,6 +487,7 @@ fn config_update(_app: &App, model: &mut ConfigModel, update: Update) {
 }
 
 fn config_view(_app: &App, model: &ConfigModel, frame: Frame) {
+    frame.clear(nannou::color::rgb(0.1, 0.1, 0.1));
     model.egui.draw_to_frame(&frame).unwrap();
 }
 
@@ -629,6 +636,7 @@ fn model(app: &App) -> Model {
         .event(window_event)
         .view(view)
         .fullscreen()
+        .msaa_samples(4)
         .build()
         .unwrap();
 
@@ -764,6 +772,8 @@ fn update(app: &App, model: &mut Model, _update: Update) {
 }
 
 fn view(app: &App, model: &Model, frame: Frame) {
+    frame.clear(BLACK);
+
     let draw = app.draw();
     let texture = wgpu::Texture::from_image(app, &model.image);
 
@@ -771,6 +781,5 @@ fn view(app: &App, model: &Model, frame: Frame) {
         .xy(model.dvd_rect.xy())
         .wh(model.dvd_rect.wh());
 
-    frame.clear(BLACK);
     draw.to_frame(app, &frame).unwrap();
 }
